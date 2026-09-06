@@ -1,5 +1,7 @@
-python exp_pipe.py \
---gpu 7 \
+#!/bin/bash
+export PYTHONWARNINGS="ignore"
+python3 exp_pipe.py \
+--gpu 0 \
 --model Transolver_Structured_Mesh_2D \
 --n-hidden 128 \
 --n-heads 8 \
@@ -12,5 +14,6 @@ python exp_pipe.py \
 --unified_pos 0 \
 --ref 8 \
 --eval 0 \
+--data_path data/fno/pipe \
 --save_name pipe_Transolver
 

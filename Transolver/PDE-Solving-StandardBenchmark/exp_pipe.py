@@ -53,9 +53,9 @@ def main():
     INPUT_Y = args.data_path + '/Pipe_Y.npy'
     OUTPUT_Sigma = args.data_path + '/Pipe_Q.npy'
 
-    ntrain = 1000
-    ntest = 200
-    N = 1200
+    ntrain = 10
+    ntest = 2
+    N = 12
 
     r1 = args.downsamplex
     r2 = args.downsampley
