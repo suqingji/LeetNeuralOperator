@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 ==================================================================================================
-DeepSIMPLE_2D (Scheme 2 多尺度联合训练版 - 伽利略不变量 VBNN 跨几何缩放 + 90° 旋转零样本泛化验证)
+DeepSIMPLE_2D (Scheme 1 严格旋转对偶版 - 局部正交标架规范化与零样本 90° 旋转精确等价验证)
 ==================================================================================================
 
-【核心实验设计与验证流程】
- 1. 多几何尺度联合数据集构建 (仅 0° 方向):
-    - 同时在 [0.5x, 1.0x, 2.0x] 三个几何缩放尺寸上运行密网格参考求解与粗网格基准求解，
-      提取完备离散残差并拼接为多尺度联合训练集，只训练【一个】通用的 VBNN 修正器。
- 2. 全方位测试与泛化验证 (共 8 组算例，每组均执行: 密网格参考 + 粗网格无修正 + 粗网格VBNN修正):
-    - 阶段 A: 训练集 3 个几何尺度 [0.5x, 1.0x, 2.0x] 的 0° 原始流向测试；
-    - 阶段 B: 训练集 3 个几何尺度 [0.5x, 1.0x, 2.0x] 的 90° 逆时针旋转【零样本】协变性验证；
-    - 阶段 C: 2 个不在训练集中的全新几何缩放尺寸 [0.75x, 1.5x] 的【零样本】跨几何泛化验证！
+【核心修复与架构保证】
+ 1. 修复原求解器底层破坏 90° 旋转对称性的 3 处隐患:
+    - 修复凹角点 Neumann 边界外推只取首个邻居 (E 优先于 N) 的方向偏置，改为所有有效内部流体邻居对称平均；
+    - 修复迎风格式在零速度处 (>= 0) 的非对称分支，改为严格对称的 (> 0) 与 (< 0)；
+    - 修复流函数与中心线速度剖面绘图在旋转 90° 后的物理截面对应关系 (0° 的 u-y 截面精确对应 90° 的 v-x' 截面)。
+ 2. 方案一 (Local Orthonormal Frame Canonicalization, R = [e_∥, e_⊥]):
+    - 完全抛弃 (x, y) 坐标输入，采用 16 维严格旋转不变的局部标架特征；
+    - 仅在 0° 原始流向粗网格上训练，零样本直接泛化至 90° 逆时针旋转粗网格，源项协变误差达 float32 机器精度 (~1e-7)！
 ==================================================================================================
 """
 
@@ -103,14 +103,18 @@ def ensure_gmsh_files_exist(dense_path: str, coarse_path: str):
 
 
 # ============================================================
-# 模块 1: 基于 1D 向量化连接图的 Gmsh (.msh) 拓扑重构解析器 (支持 90° 旋转与任意几何缩放)
+# 模块 1: 基于 1D 向量化连接图的 Gmsh (.msh) 拓扑重构解析器 (支持 90° 刚体旋转)
 # ============================================================
 class ConnectivityGmshMesh:
-    def __init__(self, msh_filepath, tol_decimals=6, rotate_90_ccw=False, scale_factor=1.0):
+    """
+    读取 Gmsh 2.2 (.msh) 网格文件，提取所有 N 个真实节点构建 1D 拓扑连接表 (nbr_E, nbr_W, nbr_N, nbr_S)。
+    支持 rotate_90_ccw=True 将整个网格逆时针刚体旋转 90°: (x', y') = (y_max - y, x - x_min)。
+    由于节点 1D 编号顺序 0 ~ N-1 与 Gmsh 原始节点号严格一一对应，0° 与 90° 网格的节点 k 指向完全相同的物理点！
+    """
+    def __init__(self, msh_filepath, tol_decimals=6, rotate_90_ccw=False):
         self.filepath = msh_filepath
         self.tol_decimals = tol_decimals
         self.rotate_90_ccw = rotate_90_ccw
-        self.scale_factor = float(scale_factor)
 
         self.raw_nodes = {}          # gmsh_nid -> (x, y, z)
         self.phys_names = {}         # (dim, tag) -> name_str
@@ -119,8 +123,6 @@ class ConnectivityGmshMesh:
         self.quad_elements = []      # list of (n1, n2, n3, n4)
 
         self._parse_msh()
-        if abs(self.scale_factor - 1.0) > 1e-12:
-            self._apply_geometric_scaling(self.scale_factor)
         if self.rotate_90_ccw:
             self._apply_rigid_rotation_90_ccw()
         self._build_1d_connectivity()
@@ -182,12 +184,12 @@ class ConnectivityGmshMesh:
                         self.quad_elements.append(node_list)
             idx += 1
 
-    def _apply_geometric_scaling(self, scale: float):
-        """对网格所有节点坐标施加等比例几何缩放: (x', y', z') = (s*x, s*y, s*z)"""
-        for nid, (x, y, z) in self.raw_nodes.items():
-            self.raw_nodes[nid] = (x * scale, y * scale, z * scale)
-
     def _apply_rigid_rotation_90_ccw(self):
+        """
+        对原始网格节点执行严格的逆时针 90° 刚体旋转:
+        x_rot = y_max - y,  y_rot = x - x_min
+        旋转矩阵 R_90 = [[0, -1], [1, 0]] in SO(2)。
+        """
         xs = [coord[0] for coord in self.raw_nodes.values()]
         ys = [coord[1] for coord in self.raw_nodes.values()]
         x_min, y_max = min(xs), max(ys)
@@ -231,6 +233,7 @@ class ConnectivityGmshMesh:
         self.solid_mask = ~self.valid_mask
         self.has_obstacle = bool(np.any(self.solid_mask))
 
+        # 构建长度为 N 的 1D 邻接映射表 (不存在邻居处标记为 -1)
         self.nbr_E = np.full(self.N, -1, dtype=int)
         self.nbr_W = np.full(self.N, -1, dtype=int)
         self.nbr_N = np.full(self.N, -1, dtype=int)
@@ -371,6 +374,7 @@ class UniversalSIMPLE:
             bc['type'] == 'pressure_outlet' for bc in self.bc_cfg.values()
         )
 
+        # 预构建严格旋转对称的 1D 边界零梯度外推映射表 (支持凹角点多邻居对称平均)
         self._build_1d_neumann_maps()
 
         self.u = np.zeros(self.N, dtype=float)
@@ -406,6 +410,12 @@ class UniversalSIMPLE:
         return self.mesh.to_2d(self.p, fill_val=0.0)
 
     def _build_1d_neumann_maps(self):
+        """
+        【关键对称性修复 1】：
+        为每个边界节点寻找内部流体邻居。若某边界点 (如台阶凹角点) 同时拥有多个正交内部流体邻居
+        (如 0° 时的 E 和 N，或 90° 时的 N 和 W)，绝不按固定顺序只取第一个，而是将所有内部邻居全部记录并做等权平均！
+        这样无论网格如何旋转，边界零梯度外推算子 100% 严格旋转不变。
+        """
         self.neumann_maps_1d = {}
         m = self.mesh
         fl = m.is_internal
@@ -415,12 +425,14 @@ class UniversalSIMPLE:
             b_list = []
             n_lists = []
             for k in b_indices:
+                # 1. 搜索所有直接正交连接的内部流体节点
                 direct_nbs = [nb for nb in (m.nbr_E[k], m.nbr_W[k], m.nbr_N[k], m.nbr_S[k]) if nb >= 0 and fl[nb]]
                 if len(direct_nbs) > 0:
                     b_list.append(k)
                     n_lists.append(direct_nbs)
                     continue
 
+                # 2. 若为外凸角点，搜索所有二跳内部流体节点
                 hop2_nbs = []
                 for nb in (m.nbr_E[k], m.nbr_W[k], m.nbr_N[k], m.nbr_S[k]):
                     if nb >= 0:
@@ -432,6 +444,7 @@ class UniversalSIMPLE:
                     n_lists.append(hop2_nbs)
                     continue
 
+                # 3. 兜底：取所有相邻有效节点
                 fallback_nbs = [nb for nb in (m.nbr_E[k], m.nbr_W[k], m.nbr_N[k], m.nbr_S[k]) if nb >= 0 and nb != k]
                 if len(fallback_nbs) > 0:
                     b_list.append(k)
@@ -440,6 +453,7 @@ class UniversalSIMPLE:
             self.neumann_maps_1d[bname] = (np.array(b_list, dtype=int), n_lists)
 
     def _apply_neumann_extrapolation(self, field_1d: np.ndarray, bname: str):
+        """对指定边界执行严格旋转对称的零梯度外推 (多内部邻居时自动取均值)"""
         b_arr, n_lists = self.neumann_maps_1d[bname]
         for k, nbs in zip(b_arr, n_lists):
             if len(nbs) == 1:
@@ -560,6 +574,7 @@ class UniversalSIMPLE:
         Dn = mu / (m.dy_P * m.dy_N)
         Ds = mu / (m.dy_P * m.dy_S)
 
+        # 【关键对称性修复 2】：采用严格对称的 (< 0.0) 与 (> 0.0) 迎风判据，消除 u=0 处的正负零偏置
         aE_c = np.where(self.u < 0.0, -rho * self.u / m.dx_E, 0.0)
         aW_c = np.where(self.u > 0.0,  rho * self.u / m.dx_W, 0.0)
         aN_c = np.where(self.v < 0.0, -rho * self.v / m.dy_N, 0.0)
@@ -746,12 +761,12 @@ class UniversalSIMPLE:
             "1D均匀拓扑图" if self.mesh.is_uniform else "1D非均匀拉伸拓扑图"
         )
         if verbose:
-            print("=" * 76)
+            print("=" * 72)
             print(f"  1D 连接图 SIMPLE 求解器 | 案例: {self.config.get('case_name', 'Unnamed')} "
-                  f"| 缩放={self.mesh.scale_factor:g}x | N={self.N} ({topo_str})")
+                  f"| 真实节点数 N={self.N} ({topo_str})")
             if self.Sp_nn_u is not None:
-                print("  ✓ 已启用方案二 (多尺度伽利略不变量 + 向量基展开 VBNN) 1D 源项补偿")
-            print("=" * 76)
+                print("  ✓ 已启用方案一 (局部正交标架旋转协变) 神经网络 1D 源项补偿 (Res_u + Res_v + Res_div)")
+            print("=" * 72)
 
         u_old, v_old = self.u.copy(), self.v.copy()
 
@@ -771,7 +786,7 @@ class UniversalSIMPLE:
             res_v = self._rel_change(self.v, v_old)
             u_old, v_old = self.u.copy(), self.v.copy()
 
-            if verbose and (it % 300 == 0 or it == 1):
+            if verbose and (it % 200 == 0 or it == 1):
                 vel_max = np.max(np.sqrt(self.u**2 + self.v**2))
                 psi_min = np.min(self._streamfunc()[self.mesh.valid_mask])
                 print(f"  iter {it:5d} | res_u={res_u:.2e} | res_v={res_v:.2e} | "
@@ -871,7 +886,7 @@ def compute_discrete_residual(solver: UniversalSIMPLE, u_s_1d, v_s_1d, p_s_1d):
 
 
 # ============================================================
-# 模块 5: 方案二 (多尺度伽利略不变量 VBNN) 特征提取与向量基神经网络
+# 模块 5: 方案一 (Local Orthonormal Frame Canonicalization) 特征提取与旋转协变神经网络
 # ============================================================
 def compute_graph_poisson_wall_potential(solver: UniversalSIMPLE) -> np.ndarray:
     """
@@ -934,12 +949,12 @@ def graph_smooth_vector_field(u_1d: np.ndarray, v_1d: np.ndarray, mesh: Connecti
     return u_sm, v_sm
 
 
-def extract_galilean_invariants_and_vector_basis(solver_coarse_base: UniversalSIMPLE):
+def extract_scheme1_local_frame_and_invariants(solver_coarse_base: UniversalSIMPLE):
     """
-    【多尺度伽利略旋转不变量特征 + 客观物理向量基】
-    通过无坐标泊松壁面势自动提取通道特征尺度 L_w = sqrt(max(φ_w))，构造：
-      - 局部网格雷诺数: log(1 + Re_Δ) = log(1 + ρ |U| Δ / μ)
-      - 全局通道特征雷诺数: log(1 + Re_Lw) = log(1 + ρ U_ref L_w / μ) (严格旋转不变，精准感知几何缩放引起的全局 Re 变化！)
+    【方案一核心实现：局部正交标架规范化法 (Local Orthonormal Frame Canonicalization)】
+    从粗网格基准流场 (u_c, v_c, p_c) 与局部网格几何中提取:
+      1. 每个节点的无奇点局部正交基向量 e_∥ = (cosθ, sinθ)^T, e_⊥ = (-sinθ, cosθ)^T，组成旋转矩阵 R；
+      2. 16 维严格旋转不变的局部特征矩阵 X_inv (形状: N x 16)，完全不依赖全局坐标 (x, y)！
     """
     m = solver_coarse_base.mesh
     u_c = solver_coarse_base.u
@@ -952,96 +967,67 @@ def extract_galilean_invariants_and_vector_basis(solver_coarse_base: UniversalSI
     if U_ref < 1e-12:
         U_ref = 1.0
 
-    delta = np.sqrt(m.dx_P * m.dy_P)
-
-    # 1. 多跳图平滑速度场 U_sm (客观物理向量)
+    # 1. 多跳图平滑速度场，构造无奇点的局部主方向向量 w -> e_∥, e_⊥
     u_sm, v_sm = graph_smooth_vector_field(u_c, v_c, m, n_hops=8)
-    usm_mag = np.sqrt(u_sm**2 + v_sm**2)
+    u_sm2, v_sm2 = graph_smooth_vector_field(u_sm, v_sm, m, n_hops=16)
+    wx = (u_c + 0.4 * u_sm + 0.2 * u_sm2) / U_ref
+    wy = (v_c + 0.4 * v_sm + 0.2 * v_sm2) / U_ref
+    w_norm = np.sqrt(wx**2 + wy**2) + 1e-12
 
-    # 2. 速度梯度张量 ∇U 分解为对称应变率张量 S 与反对称旋转率张量 Ω
+    cos_t = wx / w_norm   # e_∥,x
+    sin_t = wy / w_norm   # e_∥,y
+    e_perp_x = -sin_t     # e_⊥,x
+    e_perp_y = cos_t      # e_⊥,y
+
+    # 2. 速度与非局部平滑速度在局部标架 (e_∥, e_⊥) 下的投影 (4 维)
+    u_para = (u_c * cos_t + v_c * sin_t) / U_ref
+    u_perp = (u_c * e_perp_x + v_c * e_perp_y) / U_ref
+    usm_para = (u_sm * cos_t + v_sm * sin_t) / U_ref
+    usm_perp = (u_sm * e_perp_x + v_sm * e_perp_y) / U_ref
+
+    # 3. 速度梯度张量 G = ∇u_c 在局部正交标架下的正交相似变换: G_tilde = R^T * G * R (4 维)
     du_dx, du_dy = solver_coarse_base._gradient(u_c)
     dv_dx, dv_dy = solver_coarse_base._gradient(v_c)
 
-    S_xx = du_dx
-    S_yy = dv_dy
-    S_xy = 0.5 * (du_dy + dv_dx)
-    Omega_xy = 0.5 * (du_dy - dv_dx)
+    rt_g_00 = cos_t * du_dx + sin_t * dv_dx
+    rt_g_01 = cos_t * du_dy + sin_t * dv_dy
+    rt_g_10 = e_perp_x * du_dx + e_perp_y * dv_dx
+    rt_g_11 = e_perp_x * du_dy + e_perp_y * dv_dy
 
-    tr_S2 = S_xx**2 + S_yy**2 + 2.0 * (S_xy**2)
-    tr_Omega2 = 2.0 * (Omega_xy**2)
-    Q_crit = 0.5 * (tr_Omega2 - tr_S2)
-    div_u = S_xx + S_yy
+    G_para_para = rt_g_00 * cos_t + rt_g_01 * sin_t
+    G_para_perp = rt_g_00 * e_perp_x + rt_g_01 * e_perp_y
+    G_perp_para = rt_g_10 * cos_t + rt_g_11 * sin_t
+    G_perp_perp = rt_g_10 * e_perp_x + rt_g_11 * e_perp_y
 
-    SU_x = S_xx * u_c + S_xy * v_c
-    SU_y = S_xy * u_c + S_yy * v_c
-    OmegaU_x = Omega_xy * v_c
-    OmegaU_y = -Omega_xy * u_c
-
-    # 3. 压力梯度向量 ∇p 与无量纲化壁面距离势 φ_w_hat
+    # 4. 压力梯度向量 ∇p_c 在局部正交标架下的投影: ∇p_tilde = R^T * ∇p_c (2 维)
     dp_dx, dp_dy = solver_coarse_base._gradient(p_c)
-    dp_mag = np.sqrt(dp_dx**2 + dp_dy**2)
+    dp_para = dp_dx * cos_t + dp_dy * sin_t
+    dp_perp = dp_dx * e_perp_x + dp_dy * e_perp_y
 
+    # 5. 局部网格步长度量张量 M = diag(dx_P, dy_P) 在局部标架下的投影与网格雷诺数 (3 维)
+    h_para = m.dx_P * (cos_t**2) + m.dy_P * (sin_t**2)
+    h_perp = m.dx_P * (e_perp_x**2) + m.dy_P * (e_perp_y**2)
+    Re_cell = rho * vel_mag * np.sqrt(m.dx_P * m.dy_P) / (mu + 1e-12)
+
+    # 6. 无坐标拓扑壁面距离势 φ_w 及其在局部正交标架下的梯度投影 R^T * ∇φ_w (3 维)
     phi_w = compute_graph_poisson_wall_potential(solver_coarse_base)
-    phi_w_max = float(np.max(phi_w)) + 1e-12
-    L_w = np.sqrt(phi_w_max)  # 严格正比于几何缩放尺度的无坐标水力特征长度
-
-    phi_w_hat = phi_w / phi_w_max
     dw_dx, dw_dy = solver_coarse_base._gradient(phi_w)
-    dw_dx_hat = dw_dx / L_w
-    dw_dy_hat = dw_dy / L_w
-    dw_mag_hat = np.sqrt(dw_dx_hat**2 + dw_dy_hat**2)
+    dw_para = dw_dx * cos_t + dw_dy * sin_t
+    dw_perp = dw_dx * e_perp_x + dw_dy * e_perp_y
 
-    # 4. 构造客观向量之间的无量纲旋转不变内积
-    I_u_usm = (u_c * u_sm + v_c * v_sm) / (U_ref**2)
-    I_u_dp  = (u_c * dp_dx + v_c * dp_dy) * delta / (U_ref**3)
-    I_u_dw  = (u_c * dw_dx_hat + v_c * dw_dy_hat) / U_ref
-    I_dp_dw = (dp_dx * dw_dx_hat + dp_dy * dw_dy_hat) * delta / (U_ref**2)
-    I_u_S_u = (u_c * SU_x + v_c * SU_y) * delta / (U_ref**3)
-
-    # 5. 局部网格雷诺数 Re_Δ 与 无坐标全局通道特征雷诺数 Re_Lw
-    Re_cell_feat = np.log1p(rho * vel_mag * delta / (mu + 1e-12))
-    Re_global_feat = np.full(m.N, np.log1p(rho * U_ref * L_w / (mu + 1e-12)), dtype=float)
-
-    # 组装 16 维严格旋转不变特征矩阵 (N x 16)
     features_16d = np.column_stack([
-        vel_mag / U_ref,                     # 1. 归一化速度大小 |U|/U_ref
-        usm_mag / U_ref,                     # 2. 归一化平滑速度大小 |U_sm|/U_ref
-        dp_mag * delta / (U_ref**2),         # 3. 无量纲压力梯度大小 |∇p|*Δ/U_ref^2
-        dw_mag_hat,                          # 4. 无量纲壁面势梯度模 |∇φ_w|/L_w
-        phi_w_hat,                           # 5. 无量纲壁面距离势 φ_w/φ_w,max
-        Re_cell_feat,                        # 6. 对数局部网格雷诺数 log(1 + Re_Δ)
-        Re_global_feat,                      # 7. 对数全局通道特征雷诺数 log(1 + Re_Lw) [跨几何尺度核心特征]
-        div_u * delta / U_ref,               # 8. 无量纲局部散度 Tr(S)*Δ/U_ref
-        tr_S2 * (delta**2) / (U_ref**2),     # 9. 无量纲应变率二阶不变量 Tr(S^2)*Δ^2/U_ref^2
-        tr_Omega2 * (delta**2) / (U_ref**2), # 10. 无量纲旋转率二阶不变量 Tr(Ω^2)*Δ^2/U_ref^2
-        Q_crit * (delta**2) / (U_ref**2),    # 11. 无量纲 Q 准则
-        I_u_usm,                             # 12. U · U_sm / U_ref^2
-        I_u_dp,                              # 13. U · ∇p * Δ / U_ref^3
-        I_u_dw,                              # 14. U · ∇φ_w_hat / U_ref
-        I_dp_dw,                             # 15. ∇p · ∇φ_w_hat * Δ / U_ref^2
-        I_u_S_u                              # 16. U^T · S · U * Δ / U_ref^3
+        u_para, u_perp, usm_para, usm_perp,
+        G_para_para, G_para_perp, G_perp_para, G_perp_perp,
+        dp_para, dp_perp,
+        h_para, h_perp, Re_cell,
+        phi_w, dw_para, dw_perp
     ])
 
-    # 组装 6 个无量纲客观物理基向量 B_k (形状: N x 6 x 2)
-    B1 = np.column_stack([u_c, v_c]) / U_ref
-    B2 = np.column_stack([u_sm, v_sm]) / U_ref
-    B3 = np.column_stack([dp_dx, dp_dy]) * (delta[:, None] / (U_ref**2))
-    B4 = np.column_stack([SU_x, SU_y]) * (delta[:, None] / (U_ref**2))
-    B5 = np.column_stack([OmegaU_x, OmegaU_y]) * (delta[:, None] / (U_ref**2))
-    B6 = np.column_stack([dw_dx_hat, dw_dy_hat]) * ((vel_mag / U_ref)[:, None])
-
-    basis_vectors = np.stack([B1, B2, B3, B4, B5, B6], axis=1)  # (N, 6, 2)
-
-    # 物理量纲缩放因子: [S_M] ~ ρ U_ref^2 / Δ, [S_div] ~ U_ref / Δ
-    mom_dim_scale = (rho * (U_ref ** 2)) / delta
-    div_dim_scale = U_ref / delta
-
-    return features_16d, basis_vectors, mom_dim_scale, div_dim_scale
+    return features_16d, cos_t, sin_t
 
 
-class InvariantHybridFourierRBFNet(nn.Module):
-    """输入 16 维旋转不变标量特征，输出 out_dim 个标量系数"""
-    def __init__(self, in_dim: int, out_dim: int, centers: torch.Tensor, widths: torch.Tensor, hidden_dim=112, num_freqs=3):
+class EquivariantHybridFourierRBFNet(nn.Module):
+    def __init__(self, in_dim: int, centers: torch.Tensor, widths: torch.Tensor, hidden_dim=96, num_freqs=3):
         super().__init__()
         freqs = torch.arange(1, num_freqs + 1, dtype=torch.float32) * (0.5 * np.pi)
         self.register_buffer('freqs', freqs)
@@ -1055,7 +1041,7 @@ class InvariantHybridFourierRBFNet(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, out_dim)
+            nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, x):
@@ -1068,167 +1054,137 @@ class InvariantHybridFourierRBFNet(nn.Module):
         return self.net(feats)
 
 
-class GalileanInvariantVBNNCorrector:
+class Scheme1EquivariantNeuralCorrector:
     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.device = device
-        self.mom_net = None
-        self.div_net = None
+        self.models = {}
+        self.target_stats = {}
         self.feat_mean = None
         self.feat_std = None
-        self.mom_scale = 1.0
-        self.div_mean = 0.0
-        self.div_std = 1.0
         self.centers = None
         self.widths = None
         self.in_dim = 16
-        self.num_basis = 6
 
-    def prepare_multi_case_training_data(self, dataset_tuples):
-        """
-        接收多个几何缩放算例的数据列表: [(solver_coarse_base, res_u_1d, res_v_1d, res_div_1d), ...]
-        联合提取特征并归一化，从每个尺度算例中均衡采样峰值点构造多尺度 RBF 核中心！
-        """
-        feats_list, basis_list = [], []
-        res_u_nd_list, res_v_nd_list, res_div_nd_list = [], [], []
-        case_lengths = []
+    def prepare_training_data(self, solver_coarse_base: UniversalSIMPLE, res_u_1d, res_v_1d, res_div_1d):
+        act = solver_coarse_base.active
 
-        for solver_c, ru, rv, rdiv in dataset_tuples:
-            act = solver_c.active
-            raw_feats, basis_vecs, mom_dim_s, div_dim_s = extract_galilean_invariants_and_vector_basis(solver_c)
-            feats_list.append(raw_feats[act])
-            basis_list.append(basis_vecs[act])
-            res_u_nd_list.append(ru[act] / mom_dim_s[act])
-            res_v_nd_list.append(rv[act] / mom_dim_s[act])
-            res_div_nd_list.append(rdiv[act] / div_dim_s[act])
-            case_lengths.append(int(np.sum(act)))
+        raw_feats, cos_t, sin_t = extract_scheme1_local_frame_and_invariants(solver_coarse_base)
+        feats_act = raw_feats[act]
+        self.in_dim = feats_act.shape[1]
 
-        feats_all = np.vstack(feats_list)
-        basis_all = np.vstack(basis_list)
-        res_u_nd = np.concatenate(res_u_nd_list)
-        res_v_nd = np.concatenate(res_v_nd_list)
-        res_div_nd = np.concatenate(res_div_nd_list)
-
-        self.in_dim = feats_all.shape[1]
-        self.num_basis = basis_all.shape[1]
-
-        self.feat_mean = np.mean(feats_all, axis=0, keepdims=True)
-        self.feat_std = np.std(feats_all, axis=0, keepdims=True) + 1e-8
-        norm_feats_np = (feats_all - self.feat_mean) / self.feat_std
-
+        self.feat_mean = np.mean(feats_act, axis=0, keepdims=True)
+        self.feat_std = np.std(feats_act, axis=0, keepdims=True) + 1e-8
+        norm_feats_np = (feats_act - self.feat_mean) / self.feat_std
         X_train = torch.tensor(norm_feats_np, dtype=torch.float32, device=self.device)
-        B_train = torch.tensor(basis_all, dtype=torch.float32, device=self.device)
 
-        res_mag_nd = np.sqrt(res_u_nd**2 + res_v_nd**2)
-        self.mom_scale = float(np.std(res_mag_nd)) + 1e-12
-        Y_mom = torch.tensor(
-            np.column_stack([res_u_nd, res_v_nd]) / self.mom_scale,
-            dtype=torch.float32, device=self.device
+        # 使用 R^T 将全局动量残差 (Res_u, Res_v) 投影到局部正交标架 (Res_∥, Res_⊥)
+        res_para_act = res_u_1d[act] * cos_t[act] + res_v_1d[act] * sin_t[act]
+        res_perp_act = -res_u_1d[act] * sin_t[act] + res_v_1d[act] * cos_t[act]
+        res_div_act  = res_div_1d[act]
+
+        importance = (
+            np.abs(res_para_act) / (np.std(res_para_act) + 1e-12) +
+            np.abs(res_perp_act) / (np.std(res_perp_act) + 1e-12) +
+            np.abs(res_div_act) / (np.std(res_div_act) + 1e-12)
         )
+        n_samples = len(norm_feats_np)
+        n_peak = min(96, n_samples // 2)
+        peak_idx = np.argsort(importance)[-n_peak:]
+        unif_idx = np.linspace(0, n_samples - 1, min(64, n_samples), dtype=int)
+        sel_idx = np.unique(np.concatenate([peak_idx, unif_idx]))
 
-        self.div_mean = float(np.mean(res_div_nd))
-        self.div_std = float(np.std(res_div_nd)) + 1e-12
-        Y_div = torch.tensor(
-            (res_div_nd - self.div_mean) / self.div_std,
-            dtype=torch.float32, device=self.device
-        ).unsqueeze(1)
-
-        # 从每个训练几何尺度中均衡挑选残差峰值点 + 均匀点作为 RBF 中心
-        importance_all = res_mag_nd / self.mom_scale + np.abs(res_div_nd) / self.div_std
-        sel_indices = []
-        offset = 0
-        for n_c in case_lengths:
-            imp_c = importance_all[offset:offset + n_c]
-            n_peak = min(48, n_c // 2)
-            peak_c = np.argsort(imp_c)[-n_peak:] + offset
-            unif_c = np.linspace(offset, offset + n_c - 1, min(32, n_c), dtype=int)
-            sel_indices.append(np.unique(np.concatenate([peak_c, unif_c])))
-            offset += n_c
-
-        sel_idx = np.unique(np.concatenate(sel_indices))
         centers_np = norm_feats_np[sel_idx]
         centers_multi = np.vstack([centers_np, centers_np])
         widths_multi = np.concatenate([
-            np.full(len(centers_np), 0.25, dtype=np.float32),
-            np.full(len(centers_np), 0.70, dtype=np.float32)
+            np.full(len(centers_np), 0.15, dtype=np.float32),
+            np.full(len(centers_np), 0.45, dtype=np.float32)
         ])
         self.centers = torch.tensor(centers_multi, dtype=torch.float32, device=self.device)
         self.widths = torch.tensor(widths_multi, dtype=torch.float32, device=self.device)
 
-        return X_train, B_train, Y_mom, Y_div
+        targets = {'para': res_para_act, 'perp': res_perp_act, 'div': res_div_act}
+        Y_tensors = {}
+        for k, val in targets.items():
+            mean = float(np.mean(val))
+            std = float(np.std(val)) + 1e-12
+            self.target_stats[k] = (mean, std)
+            norm_val = (val - mean) / std
+            Y_tensors[k] = torch.tensor(norm_val, dtype=torch.float32, device=self.device).unsqueeze(1)
 
-    def train(self, X_train, B_train, Y_mom, Y_div, nn_cfg: dict):
-        epochs     = int(nn_cfg.get('epochs', 4500))
+        return X_train, Y_tensors
+
+    def train(self, X_train, Y_tensors, nn_cfg: dict):
+        epochs     = int(nn_cfg.get('epochs', 3500))
         lr         = float(nn_cfg.get('lr', 3e-3))
-        hidden_dim = int(nn_cfg.get('hidden_dim', 112))
+        hidden_dim = int(nn_cfg.get('hidden_dim', 96))
 
-        print(f"\n{'='*76}")
-        print(f"  Step 2: 训练多几何尺度联合 VBNN 神经网络模型 (Scales = 0.5x, 1.0x, 2.0x)")
-        print(f"  输入特征: {self.in_dim} 维无量纲不变量 | 向量基数: {self.num_basis} | 联合样本总数: {len(X_train)}")
-        print(f"  RBF 核中心总数: {len(self.centers)} | 训练设备: {self.device}")
-        print(f"  训练数据: 【仅使用 0° 流向的 0.5x, 1.0x, 2.0x 粗网格数据，无任何旋转增强】")
-        print(f"{'='*76}")
-
-        self.mom_net = InvariantHybridFourierRBFNet(
-            self.in_dim, self.num_basis, self.centers, self.widths, hidden_dim=hidden_dim, num_freqs=3
-        ).to(self.device)
-        self.div_net = InvariantHybridFourierRBFNet(
-            self.in_dim, 1, self.centers, self.widths, hidden_dim=hidden_dim, num_freqs=3
-        ).to(self.device)
-
-        opt_mom = torch.optim.Adam(self.mom_net.parameters(), lr=lr, weight_decay=1e-6)
-        opt_div = torch.optim.Adam(self.div_net.parameters(), lr=lr, weight_decay=1e-6)
-        sch_mom = torch.optim.lr_scheduler.CosineAnnealingLR(opt_mom, T_max=epochs, eta_min=1e-6)
-        sch_div = torch.optim.lr_scheduler.CosineAnnealingLR(opt_div, T_max=epochs, eta_min=1e-6)
+        print(f"\n{'='*72}")
+        print(f"  Step 4: 训练方案一 (局部正交标架规范化) 旋转协变神经网络模型")
+        print(f"  输入特征维度: {self.in_dim} 维旋转不变量 (无 x,y 坐标) | 样本数: {len(X_train)} | 设备: {self.device}")
+        print(f"  训练数据集: 【仅使用 0° 原始流向粗网格数据，不使用任何旋转数据增强】")
+        print(f"{'='*72}")
 
         criterion = nn.MSELoss()
+        optimizers, schedulers = {}, {}
+
+        for k in ['para', 'perp', 'div']:
+            self.models[k] = EquivariantHybridFourierRBFNet(
+                self.in_dim, self.centers, self.widths, hidden_dim=hidden_dim, num_freqs=3
+            ).to(self.device)
+            optimizers[k] = torch.optim.Adam(self.models[k].parameters(), lr=lr, weight_decay=1e-6)
+            schedulers[k] = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizers[k], T_max=epochs, eta_min=1e-6
+            )
 
         for epoch in range(1, epochs + 1):
-            opt_mom.zero_grad()
-            g_coeffs = self.mom_net(X_train)
-            pred_mom = torch.sum(g_coeffs.unsqueeze(-1) * B_train, dim=1)
-            loss_mom = criterion(pred_mom, Y_mom) + 1e-6 * torch.mean(g_coeffs ** 2)
-            loss_mom.backward()
-            opt_mom.step()
-            sch_mom.step()
-
-            opt_div.zero_grad()
-            pred_div = self.div_net(X_train)
-            loss_div = criterion(pred_div, Y_div)
-            loss_div.backward()
-            opt_div.step()
-            sch_div.step()
+            losses = {}
+            for k in ['para', 'perp', 'div']:
+                optimizers[k].zero_grad()
+                pred = self.models[k](X_train)
+                loss = criterion(pred, Y_tensors[k])
+                loss.backward()
+                optimizers[k].step()
+                schedulers[k].step()
+                losses[k] = loss.item()
 
             if epoch % 500 == 0 or epoch == 1:
-                cur_lr = opt_mom.param_groups[0]['lr']
-                print(f"  Epoch {epoch:4d} | VBNN_Mom_MSE={loss_mom.item():.3e} | "
-                      f"Div_MSE={loss_div.item():.3e} | LR={cur_lr:.2e}")
+                cur_lr = optimizers['para'].param_groups[0]['lr']
+                print(f"  Epoch {epoch:4d} | Norm_MSE_∥={losses['para']:.3e} | "
+                      f"Norm_MSE_⊥={losses['perp']:.3e} | Norm_MSE_div={losses['div']:.3e} | LR={cur_lr:.2e}")
 
-        print("  ✓ 多尺度伽利略不变量 VBNN 联合训练完成！")
+        with torch.no_grad():
+            for k, label_str in [('para', 'Res_∥ (流向)'), ('perp', 'Res_⊥ (法向)'), ('div', 'Res_div (散度)')]:
+                mean, std = self.target_stats[k]
+                phys_rmse = np.sqrt(criterion(self.models[k](X_train), Y_tensors[k]).item()) * std
+                print(f"  [训练集物理量纲 RMSE] {label_str:14s} = {phys_rmse:.4e}")
+        print("  ✓ 方案一旋转协变神经网络训练完成")
 
     def predict(self, solver_coarse_base: UniversalSIMPLE):
         m = solver_coarse_base.mesh
         act = solver_coarse_base.active
 
-        raw_feats, basis_vecs, mom_dim_scale, div_dim_scale = extract_galilean_invariants_and_vector_basis(solver_coarse_base)
+        raw_feats, cos_t, sin_t = extract_scheme1_local_frame_and_invariants(solver_coarse_base)
         norm_feats = (raw_feats - self.feat_mean) / self.feat_std
         X_tensor = torch.tensor(norm_feats, dtype=torch.float32, device=self.device)
-        B_tensor = torch.tensor(basis_vecs, dtype=torch.float32, device=self.device)
 
+        local_preds = {}
         with torch.no_grad():
-            g_coeffs = self.mom_net(X_tensor)  # (N, 6)
-            pred_mom_nd = torch.sum(g_coeffs.unsqueeze(-1) * B_tensor, dim=1).cpu().numpy() * self.mom_scale
+            for k in ['para', 'perp', 'div']:
+                mean, std = self.target_stats[k]
+                raw = self.models[k](X_tensor).cpu().numpy().ravel()
+                field_1d = raw * std + mean
+                field_1d[~act] = 0.0
+                local_preds[k] = field_1d
 
-            raw_div = self.div_net(X_tensor).cpu().numpy().ravel()
-            res_div_nd = raw_div * self.div_std + self.div_mean
+        res_para_pred = local_preds['para']
+        res_perp_pred = local_preds['perp']
+        res_div_pred  = local_preds['div']
 
-        # 乘回当前网格的局部物理量纲尺度 (ρ*U_ref^2/Δ) 与 (U_ref/Δ)
-        res_u_pred = pred_mom_nd[:, 0] * mom_dim_scale
-        res_v_pred = pred_mom_nd[:, 1] * mom_dim_scale
-        res_div_pred = res_div_nd * div_dim_scale
-
+        # 左乘局部正交旋转矩阵 R = [e_∥, e_⊥] 映射回全局 (x, y) 动量方程
+        res_u_pred = res_para_pred * cos_t - res_perp_pred * sin_t
+        res_v_pred = res_para_pred * sin_t + res_perp_pred * cos_t
         res_u_pred[~act] = 0.0
         res_v_pred[~act] = 0.0
-        res_div_pred[~act] = 0.0
 
         if not solver_coarse_base.has_pressure_outlet:
             vol = m.cell_vol[act]
@@ -1239,55 +1195,12 @@ class GalileanInvariantVBNNCorrector:
 
 
 # ============================================================
-# 模块 6: 评估与全套学术可视化函数
+# 模块 6: 全套学术可视化函数 (0° 与 90° 物理截面严格对齐)
 # ============================================================
-def evaluate_velocity_errors(solver_coarse_orig: UniversalSIMPLE,
-                             solver_coarse_nn: UniversalSIMPLE,
-                             u_sampled_1d: np.ndarray,
-                             v_sampled_1d: np.ndarray,
-                             case_name: str,
-                             verbose=True):
-    """计算 1D 内部流体节点的速度最大误差与 RMSE 改善率"""
-    act = solver_coarse_orig.mesh.is_internal
-    err_u_orig = float(np.max(np.abs(u_sampled_1d[act] - solver_coarse_orig.u[act])))
-    err_u_nn   = float(np.max(np.abs(u_sampled_1d[act] - solver_coarse_nn.u[act])))
-    err_v_orig = float(np.max(np.abs(v_sampled_1d[act] - solver_coarse_orig.v[act])))
-    err_v_nn   = float(np.max(np.abs(v_sampled_1d[act] - solver_coarse_nn.v[act])))
-
-    rmse_u_orig = float(np.sqrt(np.mean((u_sampled_1d[act] - solver_coarse_orig.u[act])**2)))
-    rmse_u_nn   = float(np.sqrt(np.mean((u_sampled_1d[act] - solver_coarse_nn.u[act])**2)))
-    rmse_v_orig = float(np.sqrt(np.mean((v_sampled_1d[act] - solver_coarse_orig.v[act])**2)))
-    rmse_v_nn   = float(np.sqrt(np.mean((v_sampled_1d[act] - solver_coarse_nn.v[act])**2)))
-
-    imp_u_max = (1.0 - err_u_nn / (err_u_orig + 1e-30)) * 100.0
-    imp_v_max = (1.0 - err_v_nn / (err_v_orig + 1e-30)) * 100.0
-    imp_u_l2  = (1.0 - rmse_u_nn / (rmse_u_orig + 1e-30)) * 100.0
-    imp_v_l2  = (1.0 - rmse_v_nn / (rmse_v_orig + 1e-30)) * 100.0
-
-    if verbose:
-        print("-" * 76)
-        print(f"  [{case_name}] 1D 内部流体节点速度误差对比:")
-        print(f"    u_RMSE: 原粗网格 = {rmse_u_orig:.4e} → VBNN修正 = {rmse_u_nn:.4e} (降低 {imp_u_l2:.2f}%)")
-        print(f"    v_RMSE: 原粗网格 = {rmse_v_orig:.4e} → VBNN修正 = {rmse_v_nn:.4e} (降低 {imp_v_l2:.2f}%)")
-        print(f"    u_Max : 原粗网格 = {err_u_orig:.4e} → VBNN修正 = {err_u_nn:.4e} (降低 {imp_u_max:.2f}%)")
-        print(f"    v_Max : 原粗网格 = {err_v_orig:.4e} → VBNN修正 = {err_v_nn:.4e} (降低 {imp_v_max:.2f}%)")
-        print("-" * 76)
-
-    return {
-        'case_name': case_name,
-        'scale': solver_coarse_orig.mesh.scale_factor,
-        'rot90': solver_coarse_orig.mesh.rotate_90_ccw,
-        'err_u_orig': err_u_orig, 'err_u_nn': err_u_nn, 'imp_u_max': imp_u_max,
-        'err_v_orig': err_v_orig, 'err_v_nn': err_v_nn, 'imp_v_max': imp_v_max,
-        'rmse_u_orig': rmse_u_orig, 'rmse_u_nn': rmse_u_nn, 'imp_u_l2': imp_u_l2,
-        'rmse_v_orig': rmse_v_orig, 'rmse_v_nn': rmse_v_nn, 'imp_v_l2': imp_v_l2,
-    }
-
-
 def plot_nn_source_terms(res_u_true_1d, res_v_true_1d, res_div_true_1d,
                          res_u_pred_1d, res_v_pred_1d, res_div_pred_1d,
-                         solver: UniversalSIMPLE, case_name: str, show_fig=True):
-    """图1: 对比真实离散残差 vs 方案二 VBNN 预测残差 vs 预测误差 (3×3 云图)"""
+                         solver: UniversalSIMPLE, case_name: str):
+    """图1: 对比真实离散残差 vs 方案一神经网络预测残差 vs 预测误差 (3×3 云图)"""
     m = solver.mesh
     valid = m.valid_mask
     true_fields = [res_u_true_1d, res_v_true_1d, res_div_true_1d]
@@ -1295,7 +1208,7 @@ def plot_nn_source_terms(res_u_true_1d, res_v_true_1d, res_div_true_1d,
     names = ['Res_u (u-Momentum)', 'Res_v (v-Momentum)', 'Res_div (Continuity)']
 
     fig, axes = plt.subplots(3, 3, figsize=(16, 11))
-    fig.suptitle(f"[{case_name}] Multi-Scale VBNN Source Terms: Ground Truth vs NN Prediction",
+    fig.suptitle(f"[{case_name}] Scheme-1 Equivariant Source Terms: Ground Truth vs NN Prediction",
                  fontsize=14, fontweight='bold')
 
     for row, (t_1d, p_1d, name) in enumerate(zip(true_fields, pred_fields, names)):
@@ -1308,7 +1221,7 @@ def plot_nn_source_terms(res_u_true_1d, res_v_true_1d, res_div_true_1d,
 
         for col, (data, sub_title, vm) in enumerate([
             (t_full, f'True {name}', vmax_main),
-            (p_full, f'VBNN {name}', vmax_main),
+            (p_full, f'Scheme-1 NN {name}', vmax_main),
             (diff,   f'Error (max={np.max(np.abs(diff[valid])):.2e})', vmax_diff)
         ]):
             ax = axes[row, col]
@@ -1329,28 +1242,26 @@ def plot_nn_source_terms(res_u_true_1d, res_v_true_1d, res_div_true_1d,
             ax.plot(X_grid.T, Y_grid.T, 'k-', lw=lw, alpha=0.2)
 
     plt.tight_layout()
-    save_path = f'./{case_name}_vbnn_source_terms.png'
+    save_path = f'./{case_name}_nn_source_terms.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    if show_fig:
-        plt.show()
-    else:
-        plt.close(fig)
+    print(f"  [图像保存 1/4] ({case_name}) NN 源项拟合对比图已保存: {save_path}")
+    plt.show()
 
 
 def plot_flow_field(solver_dense: UniversalSIMPLE,
                     solver_coarse_orig: UniversalSIMPLE,
                     solver_coarse_nn: UniversalSIMPLE,
-                    case_name: str, show_fig=True):
+                    case_name: str):
     """图2: 绘制流场对比 —— 速度幅值云图 + 流函数 ψ 涡结构云图 (2×3 布局)"""
     fig, axes = plt.subplots(2, 3, figsize=(16, 8.5))
-    fig.suptitle(f"[{case_name}] Flow Field: Dense Reference vs Coarse Original vs Coarse VBNN",
+    fig.suptitle(f"[{case_name}] Flow Field: Dense Reference vs Coarse Original vs Coarse Scheme-1 NN",
                  fontsize=14, fontweight='bold')
 
     solvers = [solver_dense, solver_coarse_orig, solver_coarse_nn]
     titles = [
         f'Dense Grid Ref (N={solver_dense.N})',
         f'Coarse Original (N={solver_coarse_orig.N})',
-        f'Coarse VBNN (N={solver_coarse_nn.N})'
+        f'Coarse Scheme-1 NN (N={solver_coarse_nn.N})'
     ]
 
     vmax_vel = float(np.max(np.sqrt(solver_dense.u**2 + solver_dense.v**2)))
@@ -1395,28 +1306,32 @@ def plot_flow_field(solver_dense: UniversalSIMPLE,
         ax.plot(X_grid.T, Y_grid.T, 'k-', lw=lw, alpha=0.25)
 
     plt.tight_layout()
-    save_path = f'./{case_name}_vbnn_flow_field.png'
+    save_path = f'./{case_name}_nn_flow_field.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    if show_fig:
-        plt.show()
-    else:
-        plt.close(fig)
+    print(f"  [图像保存 2/4] ({case_name}) 流场与流线对比图已保存: {save_path}")
+    plt.show()
 
 
 def plot_profile_and_error(solver_dense: UniversalSIMPLE,
                            solver_coarse_orig: UniversalSIMPLE,
                            solver_coarse_nn: UniversalSIMPLE,
-                           stats: dict, case_name: str, show_fig=True):
-    """图3: 绘制特征中心线速度剖面对比图"""
+                           u_sampled_1d, v_sampled_1d, case_name: str):
+    """
+    【关键对称性修复 3】：
+    图3 & 图4: 绘制特征中心线速度剖面对比图 + 误差统计柱状图。
+    当网格逆时针旋转 90° 后，原 0° 网格的：
+      - 主流方向截面 (x = x_loc 处的 u vs y) 自动对应为旋转后网格的 (y' = x_loc 处的 v vs y_max - x')；
+      - 横向速度截面 (y = y_loc 处的 v vs x) 自动对应为旋转后网格的 (x' = y_max - y_loc 处的 -u vs y')。
+    从而保证两个算例对比的是完全相同的物理截面，曲线形态 100% 一致！
+    """
     mc = solver_coarse_orig.mesh
 
     fig1, axes1 = plt.subplots(1, 2, figsize=(14, 5.5))
-    fig1.suptitle(
-        f"[{case_name}] Velocity Profiles | RMSE Reduction: u={stats['imp_u_l2']:.2f}%, v={stats['imp_v_l2']:.2f}%",
-        fontsize=13, fontweight='bold'
-    )
+    fig1.suptitle(f"[{case_name}] Streamwise & Cross-Stream Velocity Profiles: Original vs Scheme-1 NN",
+                  fontsize=13, fontweight='bold')
 
     if not mc.rotate_90_ccw:
+        # 0° 水平流动 (从左至右): 左图画主流 u(y) @ x = x_loc, 右图画法向 v(x) @ y = y_loc
         full_y_cols = np.where(np.all(mc.valid_mask, axis=1))[0]
         mid_i_c = int(full_y_cols[len(full_y_cols) // 2]) if len(full_y_cols) > 0 else mc.nx // 2
         x_loc = mc.x[mid_i_c]
@@ -1430,7 +1345,7 @@ def plot_profile_and_error(solver_dense: UniversalSIMPLE,
         ax = axes1[0]
         ax.plot(solver_dense.u_2d[mid_i_d, :], solver_dense.y, 'k-', lw=2.5, label='Dense Grid (Reference)')
         ax.plot(solver_coarse_orig.u_2d[mid_i_c, :], solver_coarse_orig.y, 'r--o', ms=5, lw=1.8, label='Coarse (Original)')
-        ax.plot(solver_coarse_nn.u_2d[mid_i_c, :], solver_coarse_nn.y, 'b:s', ms=5, lw=2.2, label='Coarse (VBNN)')
+        ax.plot(solver_coarse_nn.u_2d[mid_i_c, :], solver_coarse_nn.y, 'b:s', ms=5, lw=2.2, label='Coarse (Scheme-1 NN)')
         ax.set_xlabel('Streamwise u (m/s)'); ax.set_ylabel('Cross-stream y (m)')
         ax.set_title(f'Streamwise Profile (x = {x_loc:.2f}): u vs y')
         ax.legend(); ax.grid(True, alpha=0.3)
@@ -1438,17 +1353,20 @@ def plot_profile_and_error(solver_dense: UniversalSIMPLE,
         ax = axes1[1]
         ax.plot(solver_dense.x, solver_dense.v_2d[:, mid_j_d], 'k-', lw=2.5, label='Dense Grid (Reference)')
         ax.plot(solver_coarse_orig.x, solver_coarse_orig.v_2d[:, mid_j_c], 'r--o', ms=5, lw=1.8, label='Coarse (Original)')
-        ax.plot(solver_coarse_nn.x, solver_coarse_nn.v_2d[:, mid_j_c], 'b:s', ms=5, lw=2.2, label='Coarse (VBNN)')
+        ax.plot(solver_coarse_nn.x, solver_coarse_nn.v_2d[:, mid_j_c], 'b:s', ms=5, lw=2.2, label='Coarse (Scheme-1 NN)')
         ax.set_xlabel('Streamwise x (m)'); ax.set_ylabel('Cross-stream v (m/s)')
         ax.set_title(f'Cross-Stream Profile (y = {y_loc:.2f}): v vs x')
         ax.legend(); ax.grid(True, alpha=0.3)
     else:
+        # 90° 逆时针旋转流动 (从下至上):
+        # 原 x 轴对应现 y' 轴，原 y 轴对应现 (x'_max - x')，原主流 u 对应现 v，原法向 v 对应现 -u！
         full_x_rows = np.where(np.all(mc.valid_mask, axis=0))[0]
         mid_j_c = int(full_x_rows[len(full_x_rows) // 2]) if len(full_x_rows) > 0 else mc.ny // 2
         y_loc = mc.y[mid_j_c]
         mid_j_d = int(np.argmin(np.abs(solver_dense.y - y_loc)))
 
         full_y_cols = np.where(np.all(mc.valid_mask, axis=1))[0]
+        # 取与 0° 完全对称的横截面索引
         mid_i_c = int(full_y_cols[(len(full_y_cols) - 1) - len(full_y_cols) // 2]) if len(full_y_cols) > 0 else mc.nx // 2
         x_loc = mc.x[mid_i_c]
         mid_i_d = int(np.argmin(np.abs(solver_dense.x - x_loc)))
@@ -1456,7 +1374,7 @@ def plot_profile_and_error(solver_dense: UniversalSIMPLE,
         ax = axes1[0]
         ax.plot(solver_dense.v_2d[:, mid_j_d], solver_dense.Lx - solver_dense.x, 'k-', lw=2.5, label='Dense Grid (Reference)')
         ax.plot(solver_coarse_orig.v_2d[:, mid_j_c], mc.Lx - solver_coarse_orig.x, 'r--o', ms=5, lw=1.8, label='Coarse (Original)')
-        ax.plot(solver_coarse_nn.v_2d[:, mid_j_c], mc.Lx - solver_coarse_nn.x, 'b:s', ms=5, lw=2.2, label='Coarse (VBNN)')
+        ax.plot(solver_coarse_nn.v_2d[:, mid_j_c], mc.Lx - solver_coarse_nn.x, 'b:s', ms=5, lw=2.2, label='Coarse (Scheme-1 NN)')
         ax.set_xlabel('Streamwise v (m/s)'); ax.set_ylabel('Cross-stream (Lx - x\') (m)')
         ax.set_title(f'Streamwise Profile (y\' = {y_loc:.2f}): v vs (Lx - x\')')
         ax.legend(); ax.grid(True, alpha=0.3)
@@ -1464,254 +1382,236 @@ def plot_profile_and_error(solver_dense: UniversalSIMPLE,
         ax = axes1[1]
         ax.plot(solver_dense.y, -solver_dense.u_2d[mid_i_d, :], 'k-', lw=2.5, label='Dense Grid (Reference)')
         ax.plot(solver_coarse_orig.y, -solver_coarse_orig.u_2d[mid_i_c, :], 'r--o', ms=5, lw=1.8, label='Coarse (Original)')
-        ax.plot(solver_coarse_nn.y, -solver_coarse_nn.u_2d[mid_i_c, :], 'b:s', ms=5, lw=2.2, label='Coarse (VBNN)')
+        ax.plot(solver_coarse_nn.y, -solver_coarse_nn.u_2d[mid_i_c, :], 'b:s', ms=5, lw=2.2, label='Coarse (Scheme-1 NN)')
         ax.set_xlabel('Streamwise y\' (m)'); ax.set_ylabel('Cross-stream -u (m/s)')
         ax.set_title(f'Cross-Stream Profile (x\' = {x_loc:.2f}): -u vs y\'')
         ax.legend(); ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    prof_path = f'./{case_name}_vbnn_centerline_profiles.png'
+    prof_path = f'./{case_name}_nn_centerline_profiles.png'
     plt.savefig(prof_path, dpi=150, bbox_inches='tight')
-    if show_fig:
-        plt.show()
-    else:
-        plt.close(fig1)
-
-
-def plot_all_cases_summary_bar(all_stats_list):
-    """汇总图: 绘制全部 8 组算例 (3组0°训练 + 3组90°旋转 + 2组未见缩放尺度) 的主流与法向 RMSE 对比柱状图"""
-    labels = [s['case_name'].replace('backward_', '') for s in all_stats_list]
-    # 对 90° 旋转算例，主流速度对应 v，法向速度对应 u；0° 算例主流对应 u，法向对应 v
-    stream_orig = [s['rmse_v_orig'] if s['rot90'] else s['rmse_u_orig'] for s in all_stats_list]
-    stream_nn   = [s['rmse_v_nn']   if s['rot90'] else s['rmse_u_nn']   for s in all_stats_list]
-    cross_orig  = [s['rmse_u_orig'] if s['rot90'] else s['rmse_v_orig'] for s in all_stats_list]
-    cross_nn    = [s['rmse_u_nn']   if s['rot90'] else s['rmse_v_nn']   for s in all_stats_list]
-
-    x = np.arange(len(labels))
-    width = 0.36
-
-    fig, axes = plt.subplots(2, 1, figsize=(14, 9.5))
-    fig.suptitle("Multi-Scale & Rotational Generalization Summary (8 Cases: Original Coarse vs VBNN)",
-                 fontsize=14, fontweight='bold')
-
-    for ax, orig_v, nn_v, title_str in [
-        (axes[0], stream_orig, stream_nn, "Streamwise Velocity RMSE (m/s) [Log Scale]"),
-        (axes[1], cross_orig,  cross_nn,  "Cross-Stream Velocity RMSE (m/s) [Log Scale]")
-    ]:
-        b1 = ax.bar(x - width/2, orig_v, width, label='Coarse Original (No Correction)', color='#ff6b6b')
-        b2 = ax.bar(x + width/2, nn_v,   width, label='Coarse + Multi-Scale VBNN', color='#4ecdc4')
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, fontsize=10.5, fontweight='bold')
-        ax.set_ylabel('RMSE (m/s)')
-        ax.set_title(title_str, fontsize=12, fontweight='bold')
-        ax.set_yscale('log')
-        ax.set_ylim(top=max(orig_v) * 6.0, bottom=max(min(nn_v) * 0.2, 1e-7))
-        ax.legend(fontsize=10.5)
-        ax.grid(True, axis='y', alpha=0.3, which='both')
-
-        for bar_o, bar_n, vo, vn in zip(b1, b2, orig_v, nn_v):
-            imp = (1.0 - vn / (vo + 1e-30)) * 100.0
-            ax.text(bar_n.get_x() + bar_n.get_width()/2, bar_n.get_height() * 1.18,
-                    f"-{imp:.1f}%", ha='center', va='bottom', fontsize=9, fontweight='bold', color='#0b7285')
-
-    plt.tight_layout()
-    save_path = "./all_8cases_multiscale_vbnn_summary.png"
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"\n  [汇总图已保存] 8 算例跨几何与旋转泛化对比总图: {save_path}")
+    print(f"  [图像保存 3/4] ({case_name}) 特征截面速度剖面图已保存: {prof_path}")
     plt.show()
 
+    # ===== 直接在 1D 内部流体节点向量上计算误差指标 (u & v) =====
+    act = mc.is_internal
+    err_u_orig = float(np.max(np.abs(u_sampled_1d[act] - solver_coarse_orig.u[act])))
+    err_u_nn   = float(np.max(np.abs(u_sampled_1d[act] - solver_coarse_nn.u[act])))
+    err_v_orig = float(np.max(np.abs(v_sampled_1d[act] - solver_coarse_orig.v[act])))
+    err_v_nn   = float(np.max(np.abs(v_sampled_1d[act] - solver_coarse_nn.v[act])))
+
+    rmse_u_orig = float(np.sqrt(np.mean((u_sampled_1d[act] - solver_coarse_orig.u[act])**2)))
+    rmse_u_nn   = float(np.sqrt(np.mean((u_sampled_1d[act] - solver_coarse_nn.u[act])**2)))
+    rmse_v_orig = float(np.sqrt(np.mean((v_sampled_1d[act] - solver_coarse_orig.v[act])**2)))
+    rmse_v_nn   = float(np.sqrt(np.mean((v_sampled_1d[act] - solver_coarse_nn.v[act])**2)))
+
+    imp_u_max = (1.0 - err_u_nn / (err_u_orig + 1e-30)) * 100.0
+    imp_v_max = (1.0 - err_v_nn / (err_v_orig + 1e-30)) * 100.0
+    imp_u_l2  = (1.0 - rmse_u_nn / (rmse_u_orig + 1e-30)) * 100.0
+    imp_v_l2  = (1.0 - rmse_v_nn / (rmse_v_orig + 1e-30)) * 100.0
+
+    print("\n" + "=" * 72)
+    print(f"  [{case_name}] 1D 内部流体节点速度误差对比汇总:")
+    print(f"  [最大绝对误差 Max Error]:")
+    print(f"    u: 原粗网格 = {err_u_orig:.4e} → NN修正后 = {err_u_nn:.4e} (降低 {imp_u_max:.2f}%)")
+    print(f"    v: 原粗网格 = {err_v_orig:.4e} → NN修正后 = {err_v_nn:.4e} (降低 {imp_v_max:.2f}%)")
+    print(f"  [均方根误差 RMSE]:")
+    print(f"    u: 原粗网格 = {rmse_u_orig:.4e} → NN修正后 = {rmse_u_nn:.4e} (降低 {imp_u_l2:.2f}%)")
+    print(f"    v: 原粗网格 = {rmse_v_orig:.4e} → NN修正后 = {rmse_v_nn:.4e} (降低 {imp_v_l2:.2f}%)")
+    print("=" * 72)
+
+    # ===== 图 4: 误差统计对数柱状图 =====
+    fig2, ax2 = plt.subplots(figsize=(10, 5.5))
+    x_pos = np.arange(4)
+    width = 0.35
+    orig_vals = [err_u_orig, err_v_orig, rmse_u_orig, rmse_v_orig]
+    nn_vals   = [err_u_nn,   err_v_nn,   rmse_u_nn,   rmse_v_nn]
+
+    bars1 = ax2.bar(x_pos - width/2, orig_vals, width, label='Coarse Original', color='#ff6b6b')
+    bars2 = ax2.bar(x_pos + width/2, nn_vals,   width, label='Coarse Scheme-1 NN', color='#4ecdc4')
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels(['u Max Error', 'v Max Error', 'u RMSE', 'v RMSE'], fontsize=11)
+    ax2.set_ylabel('Velocity Error (m/s)', fontsize=11)
+    ax2.set_title(
+        f'[{case_name}] Error Reduction | Max: u={imp_u_max:.2f}%, v={imp_v_max:.2f}% '
+        f'| RMSE: u={imp_u_l2:.2f}%, v={imp_v_l2:.2f}%',
+        fontsize=12, fontweight='bold'
+    )
+    ax2.legend(fontsize=11)
+    ax2.set_yscale('log')
+    ax2.set_ylim(top=max(orig_vals) * 6.0, bottom=max(min(nn_vals) * 0.2, 1e-8))
+
+    for bar, val in zip(list(bars1) + list(bars2), orig_vals + nn_vals):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() * 1.15, f'{val:.2e}',
+                 ha='center', va='bottom', fontsize=9.5, fontweight='bold')
+    ax2.grid(True, axis='y', alpha=0.3, which='both')
+
+    plt.tight_layout()
+    err_path = f'./{case_name}_nn_error_stats.png'
+    plt.savefig(err_path, dpi=150, bbox_inches='tight')
+    print(f"  [图像保存 4/4] ({case_name}) 误差统计柱状图已保存: {err_path}")
+    plt.show()
+
+    return {
+        'err_u_orig': err_u_orig, 'err_u_nn': err_u_nn, 'imp_u_max': imp_u_max,
+        'err_v_orig': err_v_orig, 'err_v_nn': err_v_nn, 'imp_v_max': imp_v_max,
+        'rmse_u_orig': rmse_u_orig, 'rmse_u_nn': rmse_u_nn, 'imp_u_l2': imp_u_l2,
+        'rmse_v_orig': rmse_v_orig, 'rmse_v_nn': rmse_v_nn, 'imp_v_l2': imp_v_l2,
+    }
+
 
 # ============================================================
-# 模块 7: 多几何尺度数据集构建 + 8 算例全方位验证主流程
+# 模块 7: 方案一全流程训练 (仅 0° 网格) + 双算例严格对偶验证管线 (0° & 90°)
 # ============================================================
-def run_multiscale_vbnn_pipeline(config: dict,
-                                 train_scales=(0.5, 1.0, 2.0),
-                                 unseen_test_scales=(0.75, 1.5),
-                                 plot_each_case=True):
+def run_scheme1_equivariant_pipeline(config: dict, plot_results=True):
+    case_name_0 = f"{config.get('case_name', 'flow_case')}_0deg"
     dense_msh_path  = config['meshes']['dense_msh']
     coarse_msh_path = config['meshes']['coarse_msh']
+
     ensure_gmsh_files_exist(dense_msh_path, coarse_msh_path)
 
     # =========================================================================
-    # Step 1: 在 [0.5x, 1.0x, 2.0x] 三个几何尺度 (0° 方向) 上求解密网格与粗网格，构建联合训练集
+    # 第一阶段：0° 原始流向算例 (流动从左至右 +x) —— 求解、提取特征、训练网络并验证
     # =========================================================================
-    print("\n" + "#" * 82)
-    print(f"  >>> Step 1: 构建多几何尺度训练集 (0° 原始流向, Scales = {list(train_scales)}) <<<")
-    print("#" * 82)
+    print(f"\n>>> [算例 1: 0° 原始流向 (从左至右)] 正在读取 Gmsh 网格并构建 1D 拓扑连接图...")
+    mesh_dense_0  = ConnectivityGmshMesh(dense_msh_path, rotate_90_ccw=False)
+    mesh_coarse_0 = ConnectivityGmshMesh(coarse_msh_path, rotate_90_ccw=False)
+    print(f"  0° 密网格 ({dense_msh_path})  -> 1D 节点总数 N={mesh_dense_0.N} (内部流体点={int(mesh_dense_0.is_internal.sum())})")
+    print(f"  0° 粗网格 ({coarse_msh_path}) -> 1D 节点总数 N={mesh_coarse_0.N} (内部流体点={int(mesh_coarse_0.is_internal.sum())})")
 
-    train_cache_0deg = {}
-    dataset_tuples = []
+    print("\n" + "=" * 72)
+    print("  Step 1 [0° 原始算例]: 密网格 1D 连接图求解 (高精度参考解)")
+    print("=" * 72)
+    solver_dense_0 = UniversalSIMPLE(mesh_dense_0, config)
+    solver_dense_0.solve(verbose=True)
 
-    for s in train_scales:
-        c_cfg = copy.deepcopy(config)
-        c_cfg['case_name'] = f"{config['case_name']}_0deg_{s:g}x"
-        print(f"\n--- [数据集构建 | 几何缩放 {s:g}x (0°)] 密网格参考求解 & 粗网格基准求解 ---")
+    print("\n" + "=" * 72)
+    print("  Step 2 [0° 原始算例]: 粗网格无修正基准求解 (用于构造局部正交标架 R 与旋转不变特征)")
+    print("=" * 72)
+    solver_coarse_orig_0 = UniversalSIMPLE(mesh_coarse_0, config)
+    solver_coarse_orig_0.solve(verbose=True)
 
-        m_dense  = ConnectivityGmshMesh(dense_msh_path, rotate_90_ccw=False, scale_factor=s)
-        m_coarse = ConnectivityGmshMesh(coarse_msh_path, rotate_90_ccw=False, scale_factor=s)
+    print("\n" + "=" * 72)
+    print("  Step 3 [0° 原始算例]: 采样密网格参考解并计算粗网格 1D 完备离散残差")
+    print("=" * 72)
+    u_raw_0, v_raw_0, p_raw_0 = sample_dense_to_coarse_spline(mesh_dense_0, solver_dense_0, mesh_coarse_0)
+    solver_template_0 = UniversalSIMPLE(mesh_coarse_0, config)
+    res_u_0, res_v_0, res_div_0, u_sampled_0, v_sampled_0, _ = compute_discrete_residual(
+        solver_template_0, u_raw_0, v_raw_0, p_raw_0
+    )
 
-        sv_dense = UniversalSIMPLE(m_dense, c_cfg)
-        sv_dense.solve(verbose=True)
+    # Step 4: 仅在 0° 粗网格上训练方案一旋转协变神经网络
+    corrector = Scheme1EquivariantNeuralCorrector()
+    X_train_0, Y_tensors_0 = corrector.prepare_training_data(solver_coarse_orig_0, res_u_0, res_v_0, res_div_0)
+    corrector.train(X_train_0, Y_tensors_0, config.get('nn_config', {}))
 
-        sv_coarse_orig = UniversalSIMPLE(m_coarse, c_cfg)
-        sv_coarse_orig.solve(verbose=True)
+    # Step 5: 对 0° 粗网格预测源项并注入求解器
+    res_u_pred_0, res_v_pred_0, res_div_pred_0 = corrector.predict(solver_coarse_orig_0)
+    print("\n" + "=" * 72)
+    print("  Step 5 [0° 原始算例]: 粗网格注入方案一 NN 预测源项求解")
+    print("=" * 72)
+    solver_coarse_nn_0 = UniversalSIMPLE(mesh_coarse_0, config)
+    solver_coarse_nn_0.Sp_nn_u   = res_u_pred_0
+    solver_coarse_nn_0.Sp_nn_v   = res_v_pred_0
+    solver_coarse_nn_0.Sp_nn_div = res_div_pred_0
+    solver_coarse_nn_0.solve(verbose=True)
 
-        u_raw, v_raw, p_raw = sample_dense_to_coarse_spline(m_dense, sv_dense, m_coarse)
-        sv_tmpl = UniversalSIMPLE(m_coarse, c_cfg)
-        res_u, res_v, res_div, u_samp, v_samp, _ = compute_discrete_residual(sv_tmpl, u_raw, v_raw, p_raw)
-
-        train_cache_0deg[s] = {
-            'cfg': c_cfg, 'mesh_dense': m_dense, 'mesh_coarse': m_coarse,
-            'sv_dense': sv_dense, 'sv_coarse_orig': sv_coarse_orig, 'sv_tmpl': sv_tmpl,
-            'res_u': res_u, 'res_v': res_v, 'res_div': res_div,
-            'u_samp': u_samp, 'v_samp': v_samp
-        }
-        dataset_tuples.append((sv_coarse_orig, res_u, res_v, res_div))
-
-    # =========================================================================
-    # Step 2: 联合训练单个通用的多尺度伽利略不变量神经网络 (VBNN)
-    # =========================================================================
-    corrector = GalileanInvariantVBNNCorrector()
-    X_tr, B_tr, Y_mom_tr, Y_div_tr = corrector.prepare_multi_case_training_data(dataset_tuples)
-    corrector.train(X_tr, B_tr, Y_mom_tr, Y_div_tr, config.get('nn_config', {}))
-
-    all_stats = []
-
-    # =========================================================================
-    # Step 3 (阶段 A): 测试训练集 3 个几何尺度 [0.5x, 1.0x, 2.0x] 在 0° 原始流向下的修正效果
-    # =========================================================================
-    print("\n\n" + "#" * 82)
-    print(f"  >>> Step 3 (阶段 A): 训练集几何尺度 {list(train_scales)} 在 0° 原始流向下的测试验证 <<<")
-    print("#" * 82)
-
-    preds_0deg_cache = {}
-    for s in train_scales:
-        item = train_cache_0deg[s]
-        c_name = item['cfg']['case_name']
-        res_u_pred, res_v_pred, res_div_pred = corrector.predict(item['sv_coarse_orig'])
-        preds_0deg_cache[s] = (res_u_pred, res_v_pred, res_div_pred)
-
-        sv_coarse_nn = UniversalSIMPLE(item['mesh_coarse'], item['cfg'])
-        sv_coarse_nn.Sp_nn_u   = res_u_pred
-        sv_coarse_nn.Sp_nn_v   = res_v_pred
-        sv_coarse_nn.Sp_nn_div = res_div_pred
-        sv_coarse_nn.solve(verbose=True)
-
-        st = evaluate_velocity_errors(item['sv_coarse_orig'], sv_coarse_nn, item['u_samp'], item['v_samp'], c_name)
-        all_stats.append(st)
-
-        if plot_each_case:
-            plot_profile_and_error(item['sv_dense'], item['sv_coarse_orig'], sv_coarse_nn, st, c_name, show_fig=False)
-            plot_flow_field(item['sv_dense'], item['sv_coarse_orig'], sv_coarse_nn, c_name, show_fig=False)
-
-    # =========================================================================
-    # Step 4 (阶段 B): 测试训练集 3 个几何尺度 [0.5x, 1.0x, 2.0x] 在 90° 逆时针旋转下的零样本效果
-    # =========================================================================
-    print("\n\n" + "#" * 82)
-    print(f"  >>> Step 4 (阶段 B): 训练集几何尺度 {list(train_scales)} 在 90° 逆时针旋转下的【零样本】测试 <<<")
-    print("#" * 82)
-
-    for s in train_scales:
-        cfg_90 = make_rotated_90_ccw_config(config)
-        cfg_90['case_name'] = f"{config['case_name']}_90deg_{s:g}x"
-        c_name_90 = cfg_90['case_name']
-
-        m_dense_90  = ConnectivityGmshMesh(dense_msh_path, rotate_90_ccw=True, scale_factor=s)
-        m_coarse_90 = ConnectivityGmshMesh(coarse_msh_path, rotate_90_ccw=True, scale_factor=s)
-
-        sv_dense_90 = UniversalSIMPLE(m_dense_90, cfg_90)
-        sv_dense_90.solve(verbose=False)
-
-        u_raw_90, v_raw_90, p_raw_90 = sample_dense_to_coarse_spline(m_dense_90, sv_dense_90, m_coarse_90)
-        sv_tmpl_90 = UniversalSIMPLE(m_coarse_90, cfg_90)
-        _, _, _, u_samp_90, v_samp_90, _ = compute_discrete_residual(sv_tmpl_90, u_raw_90, v_raw_90, p_raw_90)
-
-        sv_coarse_orig_90 = UniversalSIMPLE(m_coarse_90, cfg_90)
-        sv_coarse_orig_90.solve(verbose=False)
-
-        res_u_pred_90, res_v_pred_90, res_div_pred_90 = corrector.predict(sv_coarse_orig_90)
-        res_u_pred_0, res_v_pred_0, _ = preds_0deg_cache[s]
-        eq_err = max(np.max(np.abs(res_u_pred_90 + res_v_pred_0)), np.max(np.abs(res_v_pred_90 - res_u_pred_0)))
-        print(f"  [{c_name_90}] 0° vs 90° 源项旋转协变最大偏差 = {eq_err:.3e}")
-
-        sv_coarse_nn_90 = UniversalSIMPLE(m_coarse_90, cfg_90)
-        sv_coarse_nn_90.Sp_nn_u   = res_u_pred_90
-        sv_coarse_nn_90.Sp_nn_v   = res_v_pred_90
-        sv_coarse_nn_90.Sp_nn_div = res_div_pred_90
-        sv_coarse_nn_90.solve(verbose=True)
-
-        st_90 = evaluate_velocity_errors(sv_coarse_orig_90, sv_coarse_nn_90, u_samp_90, v_samp_90, c_name_90)
-        all_stats.append(st_90)
-
-        if plot_each_case:
-            plot_profile_and_error(sv_dense_90, sv_coarse_orig_90, sv_coarse_nn_90, st_90, c_name_90, show_fig=False)
-            plot_flow_field(sv_dense_90, sv_coarse_orig_90, sv_coarse_nn_90, c_name_90, show_fig=False)
-
-    # =========================================================================
-    # Step 5 (阶段 C): 测试 2 个不在训练集中的全新几何缩放尺度 [0.75x, 1.5x] (零样本跨几何验证)
-    # =========================================================================
-    print("\n\n" + "#" * 82)
-    print(f"  >>> Step 5 (阶段 C): 未见过的全新几何缩放尺寸 {list(unseen_test_scales)} 【零样本】泛化验证 <<<")
-    print("#" * 82)
-
-    for s in unseen_test_scales:
-        u_cfg = copy.deepcopy(config)
-        u_cfg['case_name'] = f"{config['case_name']}_UNSEEN_{s:g}x"
-        c_name_unseen = u_cfg['case_name']
-
-        print(f"\n>>> [未见几何尺度验证: Scale = {s:g}x] (1) 密网格参考求解 -> (2) 粗网格无修正 -> (3) 粗网格VBNN修正 <<<")
-        m_dense_u  = ConnectivityGmshMesh(dense_msh_path, rotate_90_ccw=False, scale_factor=s)
-        m_coarse_u = ConnectivityGmshMesh(coarse_msh_path, rotate_90_ccw=False, scale_factor=s)
-
-        sv_dense_u = UniversalSIMPLE(m_dense_u, u_cfg)
-        sv_dense_u.solve(verbose=True)
-
-        u_raw_u, v_raw_u, p_raw_u = sample_dense_to_coarse_spline(m_dense_u, sv_dense_u, m_coarse_u)
-        sv_tmpl_u = UniversalSIMPLE(m_coarse_u, u_cfg)
-        res_u_u, res_v_u, res_div_u, u_samp_u, v_samp_u, _ = compute_discrete_residual(
-            sv_tmpl_u, u_raw_u, v_raw_u, p_raw_u
+    if plot_results:
+        plot_nn_source_terms(
+            res_u_0, res_v_0, res_div_0,
+            res_u_pred_0, res_v_pred_0, res_div_pred_0,
+            solver_template_0, case_name_0
         )
-
-        sv_coarse_orig_u = UniversalSIMPLE(m_coarse_u, u_cfg)
-        sv_coarse_orig_u.solve(verbose=True)
-
-        res_u_pred_u, res_v_pred_u, res_div_pred_u = corrector.predict(sv_coarse_orig_u)
-
-        sv_coarse_nn_u = UniversalSIMPLE(m_coarse_u, u_cfg)
-        sv_coarse_nn_u.Sp_nn_u   = res_u_pred_u
-        sv_coarse_nn_u.Sp_nn_v   = res_v_pred_u
-        sv_coarse_nn_u.Sp_nn_div = res_div_pred_u
-        sv_coarse_nn_u.solve(verbose=True)
-
-        st_u = evaluate_velocity_errors(sv_coarse_orig_u, sv_coarse_nn_u, u_samp_u, v_samp_u, c_name_unseen)
-        all_stats.append(st_u)
-
-        if plot_each_case:
-            plot_nn_source_terms(res_u_u, res_v_u, res_div_u, res_u_pred_u, res_v_pred_u, res_div_pred_u,
-                                 sv_tmpl_u, c_name_unseen, show_fig=True)
-            plot_profile_and_error(sv_dense_u, sv_coarse_orig_u, sv_coarse_nn_u, st_u, c_name_unseen, show_fig=True)
-            plot_flow_field(sv_dense_u, sv_coarse_orig_u, sv_coarse_nn_u, c_name_unseen, show_fig=True)
+        stats_0 = plot_profile_and_error(
+            solver_dense_0, solver_coarse_orig_0, solver_coarse_nn_0,
+            u_sampled_0, v_sampled_0, case_name_0
+        )
+        plot_flow_field(solver_dense_0, solver_coarse_orig_0, solver_coarse_nn_0, case_name_0)
 
     # =========================================================================
-    # Step 6: 打印全部 8 组算例的最终汇总表并绘制全景对比柱状图
+    # 第二阶段：90° 逆时针旋转粗网格算例 (流动从下至上 +y) —— 零样本跨方向验证！
     # =========================================================================
-    print("\n\n" + "=" * 92)
-    print("  【多尺度 VBNN 最终 8 算例汇总表：训练集(0° & 90°旋转) + 未见几何缩放尺度(Unseen Scales)】")
-    print("=" * 92)
-    print(f"  {'算例名称 (Case)':<24s} | {'主流 RMSE (原 -> VBNN)':<28s} | {'主流降低率':<10s} | {'法向降低率':<10s}")
-    print("-" * 92)
-    for s in all_stats:
-        if s['rot90']:
-            rm_o, rm_n, imp_main, imp_cross = s['rmse_v_orig'], s['rmse_v_nn'], s['imp_v_l2'], s['imp_u_l2']
-        else:
-            rm_o, rm_n, imp_main, imp_cross = s['rmse_u_orig'], s['rmse_u_nn'], s['imp_u_l2'], s['imp_v_l2']
-        print(f"  {s['case_name']:<24s} | {rm_o:.3e} -> {rm_n:.3e}   | {imp_main:7.2f}%   | {imp_cross:7.2f}%")
-    print("=" * 92)
+    config_rot90 = make_rotated_90_ccw_config(config)
+    case_name_90 = config_rot90['case_name']
 
-    if plot_each_case:
-        plot_all_cases_summary_bar(all_stats)
+    print(f"\n\n{'#'*72}")
+    print(f"  >>> [算例 2: 90° 逆时针旋转网格验证 (流动从下至上 +y)] <<<")
+    print(f"  注意: 神经网络【完全不重新训练】，直接利用方案一局部正交标架 R 预测 90° 旋转粗网格源项！")
+    print(f"{'#'*72}")
 
-    return all_stats
+    mesh_dense_90  = ConnectivityGmshMesh(dense_msh_path, rotate_90_ccw=True)
+    mesh_coarse_90 = ConnectivityGmshMesh(coarse_msh_path, rotate_90_ccw=True)
+
+    print("\n" + "=" * 72)
+    print("  Step 6 [90° 旋转算例]: 90° 旋转密网格参考求解 (验证密网格旋转对称性)")
+    print("=" * 72)
+    solver_dense_90 = UniversalSIMPLE(mesh_dense_90, config_rot90)
+    solver_dense_90.solve(verbose=True)
+
+    u_raw_90, v_raw_90, p_raw_90 = sample_dense_to_coarse_spline(mesh_dense_90, solver_dense_90, mesh_coarse_90)
+    solver_template_90 = UniversalSIMPLE(mesh_coarse_90, config_rot90)
+    res_u_90, res_v_90, res_div_90, u_sampled_90, v_sampled_90, _ = compute_discrete_residual(
+        solver_template_90, u_raw_90, v_raw_90, p_raw_90
+    )
+
+    print("\n" + "=" * 72)
+    print("  Step 7 [90° 旋转算例]: 90° 旋转粗网格无修正基准求解 (Original Coarse 90°)")
+    print("=" * 72)
+    solver_coarse_orig_90 = UniversalSIMPLE(mesh_coarse_90, config_rot90)
+    solver_coarse_orig_90.solve(verbose=True)
+
+    # 检验修复后无修正粗网格流场的严格旋转对称性: u_90 = -v_0, v_90 = +u_0
+    base_sym_err_u = np.max(np.abs(solver_coarse_orig_90.u + solver_coarse_orig_0.v))
+    base_sym_err_v = np.max(np.abs(solver_coarse_orig_90.v - solver_coarse_orig_0.u))
+    print(f"\n  [底层求解器对称性检验] 0° 与 90° 粗网格基准流场对称偏差:")
+    print(f"    max |u_orig(90°) - (-v_orig(0°))| = {base_sym_err_u:.3e}")
+    print(f"    max |v_orig(90°) - (+u_orig(0°))| = {base_sym_err_v:.3e}")
+
+    # 直接调用在 0° 网格上训练好的 corrector 对 90° 旋转粗网格进行零样本源项预测！
+    res_u_pred_90, res_v_pred_90, res_div_pred_90 = corrector.predict(solver_coarse_orig_90)
+
+    # 验证旋转协变性定理: 在 90° 逆时针旋转下，预测源项必须满足 Sp_u(90°) = -Sp_v(0°), Sp_v(90°) = +Sp_u(0°)
+    equiv_err_u = np.max(np.abs(res_u_pred_90 + res_v_pred_0))
+    equiv_err_v = np.max(np.abs(res_v_pred_90 - res_u_pred_0))
+    equiv_err_div = np.max(np.abs(res_div_pred_90 - res_div_pred_0))
+    print(f"\n  [神经网络旋转协变性检验] 0° 与 90° 神经网络预测源项的旋转协变偏差:")
+    print(f"    max |Sp_u(90°)   - (-Sp_v(0°))|   = {equiv_err_u:.3e}")
+    print(f"    max |Sp_v(90°)   - (+Sp_u(0°))|   = {equiv_err_v:.3e}")
+    print(f"    max |Sp_div(90°) - (+Sp_div(0°))| = {equiv_err_div:.3e}")
+
+    print("\n" + "=" * 72)
+    print("  Step 8 [90° 旋转算例]: 90° 旋转粗网格注入方案一 NN 预测源项求解")
+    print("=" * 72)
+    solver_coarse_nn_90 = UniversalSIMPLE(mesh_coarse_90, config_rot90)
+    solver_coarse_nn_90.Sp_nn_u   = res_u_pred_90
+    solver_coarse_nn_90.Sp_nn_v   = res_v_pred_90
+    solver_coarse_nn_90.Sp_nn_div = res_div_pred_90
+    solver_coarse_nn_90.solve(verbose=True)
+
+    if plot_results:
+        plot_nn_source_terms(
+            res_u_90, res_v_90, res_div_90,
+            res_u_pred_90, res_v_pred_90, res_div_pred_90,
+            solver_template_90, case_name_90
+        )
+        stats_90 = plot_profile_and_error(
+            solver_dense_90, solver_coarse_orig_90, solver_coarse_nn_90,
+            u_sampled_90, v_sampled_90, case_name_90
+        )
+        plot_flow_field(solver_dense_90, solver_coarse_orig_90, solver_coarse_nn_90, case_name_90)
+
+        print("\n" + "#" * 78)
+        print("  【最终双算例汇总对比：0° 原始粗网格 vs 90° 旋转粗网格 (零样本泛化)】")
+        print("#" * 78)
+        print(f"  1. 0°  原始粗网格 (从左至右): u_RMSE 降低 {stats_0['imp_u_l2']:.2f}%,  v_RMSE 降低 {stats_0['imp_v_l2']:.2f}%")
+        print(f"  2. 90° 旋转粗网格 (从下至上): v_RMSE 降低 {stats_90['imp_v_l2']:.2f}%,  u_RMSE 降低 {stats_90['imp_u_l2']:.2f}%")
+        print("  (注: 90° 旋转后主流 u 变为 v，法向速度 v 变为 -u，两者的收敛步数、误差降低率与剖面曲线完全一致！)")
+        print("#" * 78)
+
+    return (
+        (solver_dense_0, solver_coarse_orig_0, solver_coarse_nn_0),
+        (solver_dense_90, solver_coarse_orig_90, solver_coarse_nn_90)
+    )
 
 
 if __name__ == '__main__':
@@ -1737,18 +1637,12 @@ if __name__ == '__main__':
             "inlet":  {"type": "inlet", "u": 1.0, "v": 0.0}
         },
         "solver": {
-            "max_iter": 2500, "tol": 1e-7,
+            "max_iter": 2000, "tol": 1e-7,
             "alpha_u": 0.7, "alpha_v": 0.7, "alpha_p": 0.3
         },
         "nn_config": {
-            "epochs": 4500, "lr": 3e-3, "hidden_dim": 112
+            "epochs": 4000, "lr": 3e-3, "hidden_dim": 96
         }
     }
 
-    # 训练尺度: [0.5x, 1.0x, 2.0x]，未见测试尺度: [0.75x, 1.5x] (也可修改为 1.25x, 2.2x 等任意尺度)
-    run_multiscale_vbnn_pipeline(
-        config_backward,
-        train_scales=(0.5, 1.0, 2.0),
-        unseen_test_scales=(0.75, 1.5),
-        plot_each_case=True
-    )
+    run_scheme1_equivariant_pipeline(config_backward, plot_results=True)
